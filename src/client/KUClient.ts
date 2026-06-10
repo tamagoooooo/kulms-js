@@ -1,6 +1,9 @@
 import { load } from "cheerio";
 import type { CheerioAPI, Cheerio } from "cheerio";
 import type { AnyNode } from "domhandler";
+import type { SiteListResponse } from "../types/site.js";
+import { KULMS_API_BASE } from "./constants.js";
+import { Course } from "./Course.js";
 
 const KULMS_ENTRY = "https://lms.gakusei.kyoto-u.ac.jp/sakai-login-tool/container";
 const KULMS_HOST = "lms.gakusei.kyoto-u.ac.jp";
@@ -218,6 +221,23 @@ export class KUClient {
     });
     this.cookieJar.update(response.headers);
     return response;
+  }
+
+  async getJSON<T>(path: string): Promise<T> {
+    const res = await this.fetch(`${KULMS_API_BASE}${path}`);
+    if (!res.ok) {
+      throw new Error(
+        `KULMS request failed: ${res.status} ${res.statusText} (${path})`,
+      );
+    }
+    return (await res.json()) as T;
+  }
+
+  async courses(): Promise<Course[]> {
+    const data = await this.getJSON<SiteListResponse>("/site.json");
+    return data.site_collection
+      .filter((site) => site.type === "course")
+      .map((site) => new Course(this, site));
   }
 
   private async internalFetch(

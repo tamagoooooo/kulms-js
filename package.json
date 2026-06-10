@@ -18,7 +18,8 @@
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "dependencies": {
-    "cheerio": "^1.0.0",
+    "cheerio": "^1.2.0",
+    "domhandler": "^6.0.1",
     "tsc": "^2.0.4",
     "typescript": "^6.0.3"
   }
