@@ -1,13 +1,22 @@
 import { load } from "cheerio";
 import type { CheerioAPI, Cheerio } from "cheerio";
 import type { AnyNode } from "domhandler";
-import type { SiteListResponse } from "../types/site.js";
+import type { Site, SiteListResponse } from "../types/site.js";
+import type { AssignmentListResponse } from "../types/assignment.js";
+import type { Announcement, AnnouncementListResponse } from "../types/announcement.js";
+import type { CalendarEvent, CalendarListResponse } from "../types/calendar.js";
+import type { CurrentSession } from "../types/session.js";
 import { KULMS_API_BASE } from "./constants.js";
 import { Course } from "./Course.js";
+import { Assignment } from "./Assignment.js";
 
 const KULMS_ENTRY = "https://lms.gakusei.kyoto-u.ac.jp/sakai-login-tool/container";
 const KULMS_HOST = "lms.gakusei.kyoto-u.ac.jp";
 const MAX_ITER = 20;
+// The IdP serves UA-sensitive pages; present a mainstream browser UA.
+const USER_AGENT =
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
+  "(KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36";
 
 // Base32 decode (RFC 4648)
 function base32Decode(input: string): Uint8Array<ArrayBuffer> {
@@ -86,12 +95,70 @@ function extractFormFields(
   form.find("input, select, textarea").each((_i, el) => {
     const $el = $(el);
     const name = $el.attr("name");
-    const value = $el.attr("value") ?? "";
-    if (name !== undefined && name.length > 0) {
-      fields[name] = value;
+    if (name === undefined || name.length === 0) return;
+    const type = ($el.attr("type") ?? "text").toLowerCase();
+    // Browsers don't submit buttons (callers re-inject the relevant fields)
+    // nor unchecked checkboxes/radios.
+    if (type === "submit" || type === "button" || type === "image") return;
+    if (type === "checkbox" || type === "radio") {
+      if ($el.attr("checked") !== undefined) {
+        fields[name] = $el.attr("value") ?? "on";
+      }
+      return;
     }
+    fields[name] = $el.attr("value") ?? "";
   });
   return fields;
+}
+
+/** Last path segment of a form action, stripped of any query string. */
+function actionBasename(action: string): string {
+  const path = action.split("?")[0] ?? "";
+  return path.split("/").pop() ?? "";
+}
+
+/**
+ * The SimpleSAMLphp password (login.cgi) and OTP (otplogin.cgi) forms share
+ * `id="login"` + a `sessid` field, so they must be told apart by the action
+ * basename — a plain `includes("login.cgi")` would also match otplogin.cgi.
+ */
+function findFormByActionBasename(
+  $: CheerioAPI,
+  basename: string,
+): Cheerio<AnyNode> | null {
+  const form = $("form")
+    .filter((_i, el) => actionBasename($(el).attr("action") ?? "") === basename)
+    .first();
+  return form.length > 0 ? form : null;
+}
+
+const META_REFRESH_RE = /url\s*=\s*['"]?([^'"\s]+)/i;
+
+/** Target URL of a `<meta http-equiv="refresh" content="0;URL=...">` tag. */
+function extractMetaRefreshUrl($: CheerioAPI, baseUrl: string): string | null {
+  let target: string | null = null;
+  $("meta").each((_i, el) => {
+    if (target !== null) return;
+    const equiv = ($(el).attr("http-equiv") ?? "").toLowerCase();
+    if (equiv !== "refresh") return;
+    const match = META_REFRESH_RE.exec($(el).attr("content") ?? "");
+    if (match && match[1] !== undefined) {
+      target = new URL(match[1].trim(), baseUrl).href;
+    }
+  });
+  return target;
+}
+
+const JS_REDIRECT_RE = /(?:window\.)?location(?:\.href)?\s*=\s*['"]([^'"]+)['"]/i;
+
+/**
+ * Target of a `<body onload="window.location='...'">` JS redirect, used by the
+ * 2FA method picker (authselect.php). Returns an absolute URL or null.
+ */
+function extractJsRedirectUrl(html: string, baseUrl: string): string | null {
+  const match = JS_REDIRECT_RE.exec(html);
+  if (match === null || match[1] === undefined) return null;
+  return new URL(match[1], baseUrl).href;
 }
 
 export class KUClient {
@@ -106,94 +173,78 @@ export class KUClient {
     password: string,
     totp: string,
   ): Promise<void> {
+    // Pass 1: authenticate at the IdP, establishing the _shibsession_* cookie.
     let { url, html } = await this.getFollowingRedirects(KULMS_ENTRY);
+    ({ url, html } = await this.walkIdp(url, html, username, password, totp));
 
-    let loginSubmitted = false;
-    let otpSubmitted = false;
+    if (new URL(url).hostname !== KULMS_HOST) {
+      throw new Error(`Login failed: unexpected state at ${url}`);
+    }
 
+    // Pass 2: after SAML the SP hands control back to "/", not the Sakai
+    // container, so Sakai itself never logged us in and the API stays
+    // anonymous. Re-entering the container now that _shibsession_* exists lets
+    // Apache supply REMOTE_USER so Sakai establishes the authenticated session.
+    ({ url, html } = await this.getFollowingRedirects(KULMS_ENTRY));
+    await this.walkIdp(url, html, username, password, totp);
+  }
+
+  /**
+   * Walks the SimpleSAMLphp/SP interstitial pages — password form, 2FA method
+   * picker, TOTP form, and the SAML auto-submit — until landing back on the SP
+   * host. Returns the final page so the caller can inspect where it settled.
+   */
+  private async walkIdp(
+    url: string,
+    html: string,
+    username: string,
+    password: string,
+    totp: string,
+  ): Promise<{ url: string; html: string }> {
     for (let i = 0; i < MAX_ITER; i++) {
-      if (new URL(url).hostname === KULMS_HOST) return;
+      // SimpleSAMLphp bounces between steps with a <meta refresh>, not a
+      // 3xx, so each interstitial page must be resolved before inspection.
+      ({ url, html } = await this.followMetaRefresh(url, html));
 
+      const host = new URL(url).hostname;
       const $ = load(html);
 
-      // Login form: action contains login.cgi + sessid field
-      const loginForm = $("form")
-        .filter((_i, el) => {
-          const action = $(el).attr("action") ?? "";
-          return (
-            action.includes("login.cgi") &&
-            $(el).find('input[name="sessid"]').length > 0
-          );
-        })
-        .first();
-
-      if (loginForm.length > 0) {
-        if (loginSubmitted) {
-          throw new Error(
-            "Authentication failed: incorrect username or password",
-          );
-        }
-        const action = new URL(
-          loginForm.attr("action") ?? "",
-          url,
-        ).href;
+      // Password form (action basename login.cgi + sessid field).
+      const loginForm = findFormByActionBasename($, "login.cgi");
+      if (loginForm !== null && loginForm.find('input[name="sessid"]').length > 0) {
+        const action = new URL(loginForm.attr("action") ?? "", url).href;
         const fields = extractFormFields($, loginForm);
         fields["username"] = username;
         fields["password"] = password;
         ({ url, html } = await this.submitForm(action, fields));
-        loginSubmitted = true;
-        continue;
-      }
-
-      // AuthSelect form
-      const authselectForm = $("form")
-        .filter((_i, el) => {
-          const action = $(el).attr("action") ?? "";
-          return action.includes("authselect");
-        })
-        .first();
-
-      if (authselectForm.length > 0) {
-        const action = new URL(
-          authselectForm.attr("action") ?? "",
-          url,
-        ).href;
-        const fields = extractFormFields($, authselectForm);
-        ({ url, html } = await this.submitForm(action, fields));
-        continue;
-      }
-
-      // OTP form: action contains otplogin.cgi + sessid field
-      const otpForm = $("form")
-        .filter((_i, el) => {
-          const action = $(el).attr("action") ?? "";
-          return (
-            action.includes("otplogin.cgi") &&
-            $(el).find('input[name="sessid"]').length > 0
+        ({ url, html } = await this.followMetaRefresh(url, html));
+        if (findFormByActionBasename(load(html), "login.cgi") !== null) {
+          throw new Error(
+            "Authentication failed: incorrect username or password",
           );
-        })
-        .first();
-
-      if (otpForm.length > 0) {
-        if (otpSubmitted) {
-          throw new Error("Authentication failed: incorrect TOTP");
         }
+        continue;
+      }
+
+      // TOTP form (action basename otplogin.cgi); password field carries OTP.
+      const otpForm = findFormByActionBasename($, "otplogin.cgi");
+      if (otpForm !== null && otpForm.find('input[name="sessid"]').length > 0) {
         const action = new URL(otpForm.attr("action") ?? "", url).href;
         const fields = extractFormFields($, otpForm);
         fields["username"] = username;
         fields["password"] = await generateTOTP(totp);
         ({ url, html } = await this.submitForm(action, fields));
-        otpSubmitted = true;
+        ({ url, html } = await this.followMetaRefresh(url, html));
+        if (findFormByActionBasename(load(html), "otplogin.cgi") !== null) {
+          throw new Error("Authentication failed: incorrect TOTP");
+        }
         continue;
       }
 
-      // SAML auto-submit form
+      // SAML auto-submit form back to the SP.
       const samlForm = $("form")
-        .filter((_i, el) => {
-          return $(el).find('input[name="SAMLResponse"]').length > 0;
-        })
+        .filter((_i, el) => $(el).find('input[name="SAMLResponse"]').length > 0)
         .first();
-
       if (samlForm.length > 0) {
         const action = new URL(samlForm.attr("action") ?? "", url).href;
         const fields = extractFormFields($, samlForm);
@@ -201,16 +252,44 @@ export class KUClient {
         continue;
       }
 
-      if (new URL(url).hostname === KULMS_HOST) return;
+      // 2FA method picker (authselect.php): a bodyless JS redirect
+      // (<body onload="window.location='…u2flogin.cgi?…'">) that defaults to
+      // whichever method the account prefers. We authenticate via TOTP, so
+      // force the otplogin.cgi variant. Only honoured on the IdP host — the SP
+      // portal carries inline JS that would otherwise false-match.
+      if (host !== KULMS_HOST) {
+        const jsRedirect = extractJsRedirectUrl(html, url);
+        if (jsRedirect !== null) {
+          const target = jsRedirect.replace(
+            /\/(?:u2flogin|motplogin)\.cgi/,
+            "/otplogin.cgi",
+          );
+          ({ url, html } = await this.getFollowingRedirects(target));
+          continue;
+        }
+      }
 
-      throw new Error(`Login failed: unexpected state at ${url}`);
+      break;
     }
 
-    throw new Error("Login flow exceeded maximum iterations");
+    return { url, html };
+  }
+
+  private async followMetaRefresh(
+    url: string,
+    html: string,
+  ): Promise<{ url: string; html: string }> {
+    for (let i = 0; i < MAX_ITER; i++) {
+      const target = extractMetaRefreshUrl(load(html), url);
+      if (target === null) return { url, html };
+      ({ url, html } = await this.getFollowingRedirects(target));
+    }
+    return { url, html };
   }
 
   async fetch(url: string, init?: RequestInit): Promise<Response> {
     const headers = new Headers(init?.headers);
+    if (!headers.has("User-Agent")) headers.set("User-Agent", USER_AGENT);
     const cookieStr = this.cookieJar.header();
     if (cookieStr.length > 0) headers.set("Cookie", cookieStr);
 
@@ -233,11 +312,44 @@ export class KUClient {
     return (await res.json()) as T;
   }
 
-  async courses(): Promise<Course[]> {
+  /** All sites the user belongs to, including non-course sites (raw data). */
+  async sites(): Promise<Site[]> {
     const data = await this.getJSON<SiteListResponse>("/site.json");
-    return data.site_collection
+    return data.site_collection;
+  }
+
+  async courses(): Promise<Course[]> {
+    const sites = await this.sites();
+    return sites
       .filter((site) => site.type === "course")
       .map((site) => new Course(this, site));
+  }
+
+  /** Assignments across all sites (GET /direct/assignment/my.json). */
+  async myAssignments(): Promise<Assignment[]> {
+    const data = await this.getJSON<AssignmentListResponse>(
+      "/assignment/my.json",
+    );
+    return data.assignment_collection.map((a) => new Assignment(this, a));
+  }
+
+  /** Announcements visible to the user (GET /direct/announcement/user.json). */
+  async myAnnouncements(): Promise<Announcement[]> {
+    const data = await this.getJSON<AnnouncementListResponse>(
+      "/announcement/user.json",
+    );
+    return data.announcement_collection;
+  }
+
+  /** Calendar events across all sites (GET /direct/calendar/my.json). */
+  async myCalendar(): Promise<CalendarEvent[]> {
+    const data = await this.getJSON<CalendarListResponse>("/calendar/my.json");
+    return data.calendar_collection;
+  }
+
+  /** Current session; authenticated when `userEid` is populated. */
+  async session(): Promise<CurrentSession> {
+    return this.getJSON<CurrentSession>("/session/current.json");
   }
 
   private async internalFetch(
@@ -245,6 +357,7 @@ export class KUClient {
     init?: RequestInit,
   ): Promise<Response> {
     const headers = new Headers(init?.headers);
+    if (!headers.has("User-Agent")) headers.set("User-Agent", USER_AGENT);
     const cookieStr = this.cookieJar.header();
     if (cookieStr.length > 0) headers.set("Cookie", cookieStr);
     return globalThis.fetch(url, { ...init, headers, redirect: "manual" });

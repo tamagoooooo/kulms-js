@@ -1,6 +1,5 @@
-import type { SakaiDate } from "../types/common.js";
 import type { Assignment as AssignmentData } from "../types/assignment.js";
-import type { KUClient } from "./KUClient.js"; // type-only; kept for future methods (submit, etc.)
+import type { KUClient } from "./KUClient.js"; // type-only → no runtime import cycle
 
 export class Assignment {
   constructor(
@@ -16,7 +15,13 @@ export class Assignment {
     return this.data.entityTitle;
   }
 
-  get dueTime(): SakaiDate {
-    return this.data.dueTime;
+  /**
+   * Full record from /assignment/item/{id}.json. The site/my list views omit
+   * some fields (dueTime, instructions, …); this fetches everything.
+   */
+  async details(): Promise<AssignmentData> {
+    return this.client.getJSON<AssignmentData>(
+      `/assignment/item/${this.data.id}.json`,
+    );
   }
 }
